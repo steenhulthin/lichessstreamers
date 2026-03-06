@@ -1,5 +1,6 @@
 import time
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +13,7 @@ GAMES_TO_FETCH = 10
 TOP_PLAYERS_COUNT = 10
 TOP_PLAYERS_PERF_TYPE = "blitz"
 RESULTS_ORDER_LABEL = "latest first"
+MAX_CONCURRENT_REQUESTS = 8
 LICHESS_STREAMERS_URLS = [
     "https://lichess.org/api/streamer/live",
     "https://lichess.org/api/streamers",
@@ -276,15 +278,26 @@ def load_dashboard_data() -> tuple[list[StreamerScore], str | None]:
             key=_compute_popularity_score,
             reverse=True,
         )[:MAX_STREAMERS]
-        scores: list[StreamerScore] = []
+        eligible_streamers = []
         for streamer in streamers:
             username = str(streamer.get("id") or streamer.get("name") or "").strip()
-            if not username:
-                continue
-            try:
-                scores.append(compute_streamer_score(streamer))
-            except requests.RequestException:
-                continue
+            if username:
+                eligible_streamers.append(streamer)
+
+        scores: list[StreamerScore] = []
+        if eligible_streamers:
+            max_workers = min(MAX_CONCURRENT_REQUESTS, len(eligible_streamers))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(compute_streamer_score, streamer)
+                    for streamer in eligible_streamers
+                ]
+                for future in as_completed(futures):
+                    try:
+                        score = future.result()
+                    except requests.RequestException:
+                        continue
+                    scores.append(score)
         scores.sort(key=lambda x: x.popularity_score, reverse=True)
         return scores, None
     except requests.RequestException as exc:
@@ -298,14 +311,25 @@ def load_top_players_data() -> tuple[list[TopPlayerScore], str | None]:
             perf_type=TOP_PLAYERS_PERF_TYPE,
         )
         scores: list[TopPlayerScore] = []
-        for player in top_players:
-            try:
-                score = compute_top_player_score(player, perf_type=TOP_PLAYERS_PERF_TYPE)
-            except requests.RequestException:
-                continue
-            if score is None:
-                continue
-            scores.append(score)
+        if top_players:
+            max_workers = min(MAX_CONCURRENT_REQUESTS, len(top_players))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        compute_top_player_score,
+                        player,
+                        TOP_PLAYERS_PERF_TYPE,
+                    )
+                    for player in top_players
+                ]
+                for future in as_completed(futures):
+                    try:
+                        score = future.result()
+                    except requests.RequestException:
+                        continue
+                    if score is None:
+                        continue
+                    scores.append(score)
         return scores, None
     except requests.RequestException as exc:
         return [], f"Top players API request failed: {exc}"
