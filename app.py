@@ -1,27 +1,37 @@
-import time
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import io
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import requests
 import streamlit as st
 
-POLL_SECONDS = 15
-MAX_STREAMERS = 10
+try:
+    import chess.pgn as chess_pgn
+except ImportError:
+    chess_pgn = None
+
+POLL_SECONDS = 10
+MAX_STREAMERS = 15
 GAMES_TO_FETCH = 10
-TOP_PLAYERS_COUNT = 10
+TOP_PLAYERS_COUNT = 25
 TOP_PLAYERS_PERF_TYPE = "blitz"
-RESULTS_ORDER_LABEL = "latest first"
-MAX_CONCURRENT_REQUESTS = 8
+RESULTS_ORDER_LABEL = "latest last"
+LIVE_STREAMERS_CACHE_TTL_SECONDS = 10
+TOP_PLAYERS_CACHE_TTL_SECONDS = 60
+USER_GAMES_CACHE_TTL_SECONDS = 120
+PUZZLE_CACHE_TTL_SECONDS = 60
 LICHESS_STREAMERS_URLS = [
     "https://lichess.org/api/streamer/live",
     "https://lichess.org/api/streamers",
 ]
 LICHESS_GAMES_URL_TEMPLATE = "https://lichess.org/api/games/user/{username}"
-LICHESS_TOP_PLAYERS_URL_TEMPLATE = (
-    "https://lichess.org/api/player/top/{count}/{perf_type}"
-)
+LICHESS_TOP_PLAYERS_URL_TEMPLATE = "https://lichess.org/api/player/top/{count}/{perf_type}"
+LICHESS_PUZZLE_URLS = [
+    "https://lichess.org/api/puzzle/daily",
+    "https://lichess.org/api/puzzle/next",
+]
 REQUEST_TIMEOUT_SECONDS = 12
 
 
@@ -45,6 +55,15 @@ class TopPlayerScore:
     profile_url: str
 
 
+@dataclass
+class PuzzleInfo:
+    puzzle_id: str
+    rating: int | None
+    themes: list[str]
+    fen: str
+    puzzle_url: str
+
+
 def _get_json(url: str, params: dict[str, Any] | None = None) -> Any:
     response = requests.get(
         url,
@@ -56,6 +75,7 @@ def _get_json(url: str, params: dict[str, Any] | None = None) -> Any:
     return response.json()
 
 
+@st.cache_data(ttl=LIVE_STREAMERS_CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_live_streamers() -> list[dict[str, Any]]:
     for url in LICHESS_STREAMERS_URLS:
         try:
@@ -63,15 +83,16 @@ def fetch_live_streamers() -> list[dict[str, Any]]:
         except requests.RequestException:
             continue
         if isinstance(payload, list):
-            return payload
+            return [s for s in payload if isinstance(s, dict)]
         if isinstance(payload, dict):
             if isinstance(payload.get("streamers"), list):
-                return payload["streamers"]
+                return [s for s in payload["streamers"] if isinstance(s, dict)]
             if isinstance(payload.get("data"), list):
-                return payload["data"]
+                return [s for s in payload["data"] if isinstance(s, dict)]
     return []
 
 
+@st.cache_data(ttl=TOP_PLAYERS_CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_top_players(
     count: int = TOP_PLAYERS_COUNT, perf_type: str = TOP_PLAYERS_PERF_TYPE
 ) -> list[dict[str, Any]]:
@@ -84,18 +105,7 @@ def fetch_top_players(
     return []
 
 
-def _extract_player_color(game: dict[str, Any], username: str) -> str | None:
-    username_lc = username.lower()
-    players = game.get("players", {})
-    for color in ("white", "black"):
-        player = players.get(color, {})
-        user_name = (player.get("user") or {}).get("name", "")
-        if user_name.lower() == username_lc:
-            return color
-
-    return None
-
-
+@st.cache_data(ttl=USER_GAMES_CACHE_TTL_SECONDS, show_spinner=False)
 def fetch_user_games(
     username: str, max_games: int = GAMES_TO_FETCH
 ) -> list[dict[str, Any]]:
@@ -109,22 +119,40 @@ def fetch_user_games(
     response.raise_for_status()
 
     games: list[dict[str, Any]] = []
-    lines = response.text.splitlines()
-    for line in lines:
+    for line in response.text.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            if len(lines) == 1:
-                parsed = response.json()
-                if isinstance(parsed, list):
-                    return [g for g in parsed if isinstance(g, dict)]
-                if isinstance(parsed, dict):
-                    return [parsed]
-            games.append(json.loads(line))
+            parsed = json.loads(line)
         except ValueError:
             continue
+        if isinstance(parsed, dict):
+            games.append(parsed)
     return games
+
+
+@st.cache_data(ttl=PUZZLE_CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_puzzle_payload() -> dict[str, Any]:
+    for url in LICHESS_PUZZLE_URLS:
+        try:
+            payload = _get_json(url)
+        except requests.RequestException:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
+def _extract_player_color(game: dict[str, Any], username: str) -> str | None:
+    username_lc = username.lower()
+    players = game.get("players", {})
+    for color in ("white", "black"):
+        player = players.get(color, {})
+        user_name = (player.get("user") or {}).get("name", "")
+        if user_name.lower() == username_lc:
+            return color
+    return None
 
 
 def _game_timestamp(game: dict[str, Any]) -> int:
@@ -135,8 +163,8 @@ def _game_timestamp(game: dict[str, Any]) -> int:
     return -1
 
 
-def _order_games_latest_first(games: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return sorted(games, key=_game_timestamp, reverse=True)
+def _order_games_latest_last(games: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(games, key=_game_timestamp)
 
 
 def _game_result_for_user(game: dict[str, Any], username: str) -> str:
@@ -158,7 +186,7 @@ def _compute_streak(results: list[str]) -> str:
     if len(results) < 5:
         return "-"
 
-    recent_five = results[:5]
+    recent_five = results[-5:]
     if all(result == "W" for result in recent_five):
         return "\U0001F525 Win x5"
     if all(result == "D" for result in recent_five):
@@ -218,6 +246,161 @@ def _extract_perf_rating(player: dict[str, Any], perf_type: str) -> int | None:
     return None
 
 
+def _extract_status_code(exc: requests.RequestException) -> int | None:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+    return None
+
+
+def _derive_fen_from_pgn(pgn: str, initial_ply: int | None) -> str:
+    if chess_pgn is None:
+        return ""
+    if not pgn:
+        return ""
+    try:
+        game = chess_pgn.read_game(io.StringIO(pgn))
+    except Exception:
+        return ""
+    if game is None:
+        return ""
+
+    board = game.board()
+    ply_target = initial_ply if isinstance(initial_ply, int) and initial_ply >= 0 else 0
+    for idx, move in enumerate(game.mainline_moves()):
+        if idx >= ply_target:
+            break
+        board.push(move)
+    return board.fen()
+
+
+def _extract_puzzle_info(payload: dict[str, Any]) -> PuzzleInfo:
+    puzzle = payload.get("puzzle", {})
+    game = payload.get("game", {})
+
+    puzzle_id = str((puzzle or {}).get("id") or "")
+    rating = (puzzle or {}).get("rating")
+    rating_int = rating if isinstance(rating, int) else None
+    initial_ply = (puzzle or {}).get("initialPly")
+    initial_ply_int = initial_ply if isinstance(initial_ply, int) else None
+    pgn = str((game or {}).get("pgn") or "")
+    themes = (puzzle or {}).get("themes")
+    theme_list = [str(t) for t in themes] if isinstance(themes, list) else []
+    derived_fen = _derive_fen_from_pgn(pgn, initial_ply_int)
+    fen = str(
+        (puzzle or {}).get("fen")
+        or (game or {}).get("fen")
+        or payload.get("fen")
+        or derived_fen
+        or ""
+    ).strip()
+    puzzle_url = f"https://lichess.org/training/{puzzle_id}" if puzzle_id else "https://lichess.org/training"
+
+    return PuzzleInfo(
+        puzzle_id=puzzle_id,
+        rating=rating_int,
+        themes=theme_list,
+        fen=fen,
+        puzzle_url=puzzle_url,
+    )
+
+
+def _fen_to_board_rows(fen: str) -> list[list[str]] | None:
+    piece_map = {
+        "K": "♔",
+        "Q": "♕",
+        "R": "♖",
+        "B": "♗",
+        "N": "♘",
+        "P": "♙",
+        "k": "♚",
+        "q": "♛",
+        "r": "♜",
+        "b": "♝",
+        "n": "♞",
+        "p": "♟",
+    }
+
+    parts = fen.strip().split()
+    if not parts:
+        return None
+    ranks = parts[0].split("/")
+    if len(ranks) != 8:
+        return None
+
+    board_rows: list[list[str]] = []
+    for rank in ranks:
+        row: list[str] = []
+        for token in rank:
+            if token.isdigit():
+                row.extend([""] * int(token))
+            elif token in piece_map:
+                row.append(piece_map[token])
+            else:
+                return None
+        if len(row) != 8:
+            return None
+        board_rows.append(row)
+    return board_rows
+
+
+def _render_fen_board(fen: str) -> None:
+    board_rows = _fen_to_board_rows(fen)
+    if board_rows is None:
+        st.info("FEN is missing or invalid for this puzzle payload.")
+        return
+
+    html_rows: list[str] = []
+    for rank_idx, row in enumerate(board_rows):
+        cell_html: list[str] = []
+        for file_idx, piece in enumerate(row):
+            is_light = (rank_idx + file_idx) % 2 == 0
+            bg = "#f0d9b5" if is_light else "#b58863"
+            piece_text = piece or "&nbsp;"
+            cell_html.append(
+                "<td style='width:44px;height:44px;text-align:center;vertical-align:middle;"
+                f"font-size:30px;background:{bg};'>{piece_text}</td>"
+            )
+        html_rows.append(f"<tr>{''.join(cell_html)}</tr>")
+
+    st.markdown(
+        (
+            "<table style='border-collapse:collapse;border:1px solid #666;'>"
+            f"{''.join(html_rows)}"
+            "</table>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_puzzle_panel() -> None:
+    st.subheader("Today's Puzzle (from /api/puzzle/daily)")
+    try:
+        payload = fetch_puzzle_payload()
+    except requests.RequestException as exc:
+        st.warning(f"Puzzle request failed: {exc}")
+        return
+
+    puzzle = _extract_puzzle_info(payload)
+    if not puzzle.fen and chess_pgn is None:
+        st.warning(
+            "Install dependency `chess` to derive FEN from PGN: `pip install -r requirements.txt`."
+        )
+    left_col, right_col = st.columns([1, 1])
+    with left_col:
+        st.caption("FEN Board")
+        _render_fen_board(puzzle.fen)
+    with right_col:
+        st.write(f"Puzzle ID: `{puzzle.puzzle_id or '-'}`")
+        st.write(f"Rating: `{puzzle.rating if puzzle.rating is not None else '-'}`")
+        st.write(f"Themes: `{', '.join(puzzle.themes) if puzzle.themes else '-'}`")
+        st.write(f"[Open on Lichess]({puzzle.puzzle_url})")
+        st.code(puzzle.fen or "-", language="text")
+
+
 def compute_streamer_score(streamer: dict[str, Any]) -> StreamerScore:
     username = str(streamer.get("id") or streamer.get("name") or "").strip()
     display_name = str(streamer.get("name") or username)
@@ -225,9 +408,7 @@ def compute_streamer_score(streamer: dict[str, Any]) -> StreamerScore:
     stream_status = str(stream.get("status") or "live")
     popularity_score = _compute_popularity_score(streamer)
 
-    games = _order_games_latest_first(
-        fetch_user_games(username, max_games=GAMES_TO_FETCH)
-    )
+    games = _order_games_latest_last(fetch_user_games(username, max_games=GAMES_TO_FETCH))
     results = [_game_result_for_user(game, username) for game in games]
     last_10_results = " ".join(results) if results else "-"
     streak = _compute_streak(results)
@@ -253,9 +434,7 @@ def compute_top_player_score(
     title = str(player.get("title") or "")
     rating = _extract_perf_rating(player, perf_type)
 
-    games = _order_games_latest_first(
-        fetch_user_games(username, max_games=GAMES_TO_FETCH)
-    )
+    games = _order_games_latest_last(fetch_user_games(username, max_games=GAMES_TO_FETCH))
     results = [_game_result_for_user(game, username) for game in games]
     last_10_results = " ".join(results) if results else "-"
     streak = _compute_streak(results)
@@ -273,35 +452,38 @@ def compute_top_player_score(
 def load_dashboard_data() -> tuple[list[StreamerScore], str | None]:
     try:
         streamers = fetch_live_streamers()
-        streamers = sorted(
-            streamers,
-            key=_compute_popularity_score,
-            reverse=True,
-        )[:MAX_STREAMERS]
-        eligible_streamers = []
-        for streamer in streamers:
-            username = str(streamer.get("id") or streamer.get("name") or "").strip()
-            if username:
-                eligible_streamers.append(streamer)
-
-        scores: list[StreamerScore] = []
-        if eligible_streamers:
-            max_workers = min(MAX_CONCURRENT_REQUESTS, len(eligible_streamers))
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(compute_streamer_score, streamer)
-                    for streamer in eligible_streamers
-                ]
-                for future in as_completed(futures):
-                    try:
-                        score = future.result()
-                    except requests.RequestException:
-                        continue
-                    scores.append(score)
-        scores.sort(key=lambda x: x.popularity_score, reverse=True)
-        return scores, None
     except requests.RequestException as exc:
-        return [], f"API request failed: {exc}"
+        return [], f"API request failed for live streamers: {exc}"
+
+    streamers = sorted(
+        streamers,
+        key=_compute_popularity_score,
+        reverse=True,
+    )[:MAX_STREAMERS]
+
+    scores: list[StreamerScore] = []
+    failed_requests = 0
+    rate_limited_requests = 0
+    for streamer in streamers:
+        username = str(streamer.get("id") or streamer.get("name") or "").strip()
+        if not username:
+            continue
+        try:
+            scores.append(compute_streamer_score(streamer))
+        except requests.RequestException as exc:
+            failed_requests += 1
+            if _extract_status_code(exc) == 429:
+                rate_limited_requests += 1
+
+    scores.sort(key=lambda x: x.popularity_score, reverse=True)
+    if failed_requests == 0:
+        return scores, None
+    if rate_limited_requests > 0:
+        return (
+            scores,
+            f"{failed_requests} streamer game requests failed; {rate_limited_requests} hit HTTP 429 rate limit.",
+        )
+    return scores, f"{failed_requests} streamer game requests failed."
 
 
 def load_top_players_data() -> tuple[list[TopPlayerScore], str | None]:
@@ -310,29 +492,32 @@ def load_top_players_data() -> tuple[list[TopPlayerScore], str | None]:
             count=TOP_PLAYERS_COUNT,
             perf_type=TOP_PLAYERS_PERF_TYPE,
         )
-        scores: list[TopPlayerScore] = []
-        if top_players:
-            max_workers = min(MAX_CONCURRENT_REQUESTS, len(top_players))
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(
-                        compute_top_player_score,
-                        player,
-                        TOP_PLAYERS_PERF_TYPE,
-                    )
-                    for player in top_players
-                ]
-                for future in as_completed(futures):
-                    try:
-                        score = future.result()
-                    except requests.RequestException:
-                        continue
-                    if score is None:
-                        continue
-                    scores.append(score)
-        return scores, None
     except requests.RequestException as exc:
         return [], f"Top players API request failed: {exc}"
+
+    scores: list[TopPlayerScore] = []
+    failed_requests = 0
+    rate_limited_requests = 0
+    for player in top_players:
+        try:
+            score = compute_top_player_score(player, perf_type=TOP_PLAYERS_PERF_TYPE)
+        except requests.RequestException as exc:
+            failed_requests += 1
+            if _extract_status_code(exc) == 429:
+                rate_limited_requests += 1
+            continue
+        if score is None:
+            continue
+        scores.append(score)
+
+    if failed_requests == 0:
+        return scores, None
+    if rate_limited_requests > 0:
+        return (
+            scores,
+            f"{failed_requests} top-player game requests failed; {rate_limited_requests} hit HTTP 429 rate limit.",
+        )
+    return scores, f"{failed_requests} top-player game requests failed."
 
 
 def _render_streamers_table(scores: list[StreamerScore]) -> None:
@@ -378,30 +563,31 @@ def _render_top_players_table(scores: list[TopPlayerScore]) -> None:
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
-st.set_page_config(page_title="Lichess Streamer Blunder Dashboard", layout="wide")
-st.title("Lichess Streamer Blunder Dashboard")
+st.set_page_config(page_title="Lichess Streamer Dashboard", layout="wide")
+st.title("Lichess Streamer Dashboard")
 st.caption(
-    f"Polling Lichess API every {POLL_SECONDS} seconds. No retry on failure; next poll attempts again."
+    f"Polling Lichess API every {POLL_SECONDS} seconds. Shows warnings for failed requests (including HTTP 429)."
 )
 
 
 @st.fragment(run_every=POLL_SECONDS)
 def live_dashboard() -> None:
-    started = time.strftime("%Y-%m-%d %H:%M:%S")
-    st.write(f"Last refresh: {started}")
+    st.write(f"Last refresh: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    loading_note = st.info("Loading streamer and top-player data... solve a puzzle while waiting.")
+    _render_puzzle_panel()
+
     st.subheader("Live Streamers")
-    streamer_scores, streamer_error = load_dashboard_data()
-    if streamer_error:
-        st.error(streamer_error)
-    else:
-        _render_streamers_table(streamer_scores)
+    streamer_scores, streamer_note = load_dashboard_data()
+    if streamer_note:
+        st.warning(streamer_note)
+    _render_streamers_table(streamer_scores)
 
     st.subheader(f"Top {TOP_PLAYERS_COUNT} {TOP_PLAYERS_PERF_TYPE.capitalize()} Players")
-    top_scores, top_error = load_top_players_data()
-    if top_error:
-        st.error(top_error)
-        return
+    top_scores, top_note = load_top_players_data()
+    if top_note:
+        st.warning(top_note)
     _render_top_players_table(top_scores)
+    loading_note.empty()
 
 
 live_dashboard()

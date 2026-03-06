@@ -1,2 +1,3 @@
 streamlit>=1.38
 requests>=2.31
+chess>=1.11
