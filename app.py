@@ -13,15 +13,17 @@ except ImportError:
     chess_pgn = None
 
 POLL_SECONDS = 10
-MAX_STREAMERS = 15
+MAX_STREAMERS = 10
 GAMES_TO_FETCH = 10
-TOP_PLAYERS_COUNT = 25
+TOP_PLAYERS_COUNT = 10
 TOP_PLAYERS_PERF_TYPE = "blitz"
 RESULTS_ORDER_LABEL = "latest last"
 LIVE_STREAMERS_CACHE_TTL_SECONDS = 10
 TOP_PLAYERS_CACHE_TTL_SECONDS = 60
 USER_GAMES_CACHE_TTL_SECONDS = 120
 PUZZLE_CACHE_TTL_SECONDS = 60
+PLACEHOLDER_PUZZLE_FEN = "rnbq1rk1/ppp1bpQ1/3p1np1/4p3/2B5/2B2N2/PPPPPPP1/RNB3KR w - - 0 1"
+PLACEHOLDER_PUZZLE_HINT = "Placeholder mate in one: Qh8#"
 LICHESS_STREAMERS_URLS = [
     "https://lichess.org/api/streamer/live",
     "https://lichess.org/api/streamers",
@@ -310,18 +312,18 @@ def _extract_puzzle_info(payload: dict[str, Any]) -> PuzzleInfo:
 
 def _fen_to_board_rows(fen: str) -> list[list[str]] | None:
     piece_map = {
-        "K": "♔",
-        "Q": "♕",
-        "R": "♖",
-        "B": "♗",
-        "N": "♘",
-        "P": "♙",
-        "k": "♚",
-        "q": "♛",
-        "r": "♜",
-        "b": "♝",
-        "n": "♞",
-        "p": "♟",
+        "K": "\u2654",
+        "Q": "\u2655",
+        "R": "\u2656",
+        "B": "\u2657",
+        "N": "\u2658",
+        "P": "\u2659",
+        "k": "\u265A",
+        "q": "\u265B",
+        "r": "\u265C",
+        "b": "\u265D",
+        "n": "\u265E",
+        "p": "\u265F",
     }
 
     parts = fen.strip().split()
@@ -358,10 +360,10 @@ def _render_fen_board(fen: str) -> None:
         cell_html: list[str] = []
         for file_idx, piece in enumerate(row):
             is_light = (rank_idx + file_idx) % 2 == 0
-            bg = "#f0d9b5" if is_light else "#b58863"
+            bg = "#e2d6c2" if is_light else "#63b56a"
             piece_text = piece or "&nbsp;"
             cell_html.append(
-                "<td style='width:44px;height:44px;text-align:center;vertical-align:middle;"
+                "<td style='width:20px;height:20px;text-align:center;vertical-align:middle;"
                 f"font-size:30px;background:{bg};'>{piece_text}</td>"
             )
         html_rows.append(f"<tr>{''.join(cell_html)}</tr>")
@@ -377,7 +379,20 @@ def _render_fen_board(fen: str) -> None:
 
 
 def _render_puzzle_panel() -> None:
-    st.subheader("Today's Puzzle (from /api/puzzle/daily)")
+    st.subheader("Today's Puzzle")
+    panel = st.empty()
+    with panel.container():
+        left_col, right_col = st.columns([1, 1])
+        with left_col:
+            st.caption("FEN Board")
+            _render_fen_board(PLACEHOLDER_PUZZLE_FEN)
+        with right_col:
+            st.write("Puzzle ID: `placeholder`")
+            st.write("Rating: `-`")
+            st.write("Themes: `mate`")
+            st.write(PLACEHOLDER_PUZZLE_HINT)
+            st.code(PLACEHOLDER_PUZZLE_FEN, language="text")
+
     try:
         payload = fetch_puzzle_payload()
     except requests.RequestException as exc:
@@ -389,16 +404,18 @@ def _render_puzzle_panel() -> None:
         st.warning(
             "Install dependency `chess` to derive FEN from PGN: `pip install -r requirements.txt`."
         )
-    left_col, right_col = st.columns([1, 1])
-    with left_col:
-        st.caption("FEN Board")
-        _render_fen_board(puzzle.fen)
-    with right_col:
-        st.write(f"Puzzle ID: `{puzzle.puzzle_id or '-'}`")
-        st.write(f"Rating: `{puzzle.rating if puzzle.rating is not None else '-'}`")
-        st.write(f"Themes: `{', '.join(puzzle.themes) if puzzle.themes else '-'}`")
-        st.write(f"[Open on Lichess]({puzzle.puzzle_url})")
-        st.code(puzzle.fen or "-", language="text")
+
+    with panel.container():
+        left_col, right_col = st.columns([1, 1])
+        with left_col:
+            st.caption("FEN Board")
+            _render_fen_board(puzzle.fen)
+        with right_col:
+            st.write(f"Puzzle ID: `{puzzle.puzzle_id or '-'}`")
+            st.write(f"Rating: `{puzzle.rating if puzzle.rating is not None else '-'}`")
+            st.write(f"Themes: `{', '.join(puzzle.themes) if puzzle.themes else '-'}`")
+            st.write(f"[Open on Lichess]({puzzle.puzzle_url})")
+            st.code(puzzle.fen or "-", language="text")
 
 
 def compute_streamer_score(streamer: dict[str, Any]) -> StreamerScore:
@@ -563,31 +580,32 @@ def _render_top_players_table(scores: list[TopPlayerScore]) -> None:
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
-st.set_page_config(page_title="Lichess Streamer Dashboard", layout="wide")
-st.title("Lichess Streamer Dashboard")
-st.caption(
-    f"Polling Lichess API every {POLL_SECONDS} seconds. Shows warnings for failed requests (including HTTP 429)."
-)
+st.set_page_config(page_title="Lichess Streamers and Top Players Dashboard", layout="wide")
+st.title("Lichess Streamers and Top Players Dashboard")
 
 
 @st.fragment(run_every=POLL_SECONDS)
 def live_dashboard() -> None:
     st.write(f"Last refresh: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    loading_note = st.info("Loading streamer and top-player data... solve a puzzle while waiting.")
     _render_puzzle_panel()
 
     st.subheader("Live Streamers")
+    streamers_slot = st.empty()
+    streamers_slot.info("Loading live streamers...")
     streamer_scores, streamer_note = load_dashboard_data()
-    if streamer_note:
-        st.warning(streamer_note)
-    _render_streamers_table(streamer_scores)
+    with streamers_slot.container():
+        if streamer_note:
+            st.warning(streamer_note)
+        _render_streamers_table(streamer_scores)
 
-    st.subheader(f"Top {TOP_PLAYERS_COUNT} {TOP_PLAYERS_PERF_TYPE.capitalize()} Players")
+    st.subheader(f"Top {TOP_PLAYERS_PERF_TYPE.capitalize()} Players")
+    top_slot = st.empty()
+    top_slot.info("Loading top players...")
     top_scores, top_note = load_top_players_data()
-    if top_note:
-        st.warning(top_note)
-    _render_top_players_table(top_scores)
-    loading_note.empty()
+    with top_slot.container():
+        if top_note:
+            st.warning(top_note)
+        _render_top_players_table(top_scores)
 
 
 live_dashboard()
