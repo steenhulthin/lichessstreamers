@@ -1,0 +1,9 @@
+# Streamlit
+.streamlit/secrets.toml
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# venv - newer versions of venv ignores itself (add a .gitnore file to the folder)

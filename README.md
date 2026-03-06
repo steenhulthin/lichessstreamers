@@ -1,0 +1,16 @@
+# Lichess Streamer Blunder Dashboard
+
+Live Streamlit dashboard that polls Lichess every 15 seconds, ranks up to 10 online streamers using a popularity proxy, and shows blunders from each streamer's latest analyzed game.
+
+## Run
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+## Notes
+
+- Poll interval is fixed at 15 seconds (`POLL_SECONDS` in `app.py`).
+- No retry logic is used: if a call fails, the app waits for the next 15-second poll.
+- Streamers are loaded from `/api/streamer/live` with fallback to `/api/streamers`.
