@@ -8,7 +8,7 @@ import streamlit as st
 
 POLL_SECONDS = 15
 MAX_STREAMERS = 10
-GAMES_TO_ANALYZE = 1
+GAMES_TO_FETCH = 10
 LICHESS_STREAMERS_URLS = [
     "https://lichess.org/api/streamer/live",
     "https://lichess.org/api/streamers",
@@ -22,9 +22,7 @@ class StreamerScore:
     username: str
     display_name: str
     stream_status: str
-    language: str
-    blunders_last_game: int | None
-    analyzed_games: int
+    last_10_results: str
     popularity_score: int
     profile_url: str
     stream_url: str
@@ -57,45 +55,25 @@ def fetch_live_streamers() -> list[dict[str, Any]]:
     return []
 
 
-def _extract_player_blunders(game: dict[str, Any], username: str) -> int | None:
+def _extract_player_color(game: dict[str, Any], username: str) -> str | None:
     username_lc = username.lower()
     players = game.get("players", {})
     for color in ("white", "black"):
         player = players.get(color, {})
         user_name = (player.get("user") or {}).get("name", "")
         if user_name.lower() == username_lc:
-            analysis = player.get("analysis", {})
-            if isinstance(analysis, dict):
-                if isinstance(analysis.get("blunder"), int):
-                    return analysis["blunder"]
-                if isinstance(analysis.get("blunders"), int):
-                    return analysis["blunders"]
-
-    analysis = game.get("analysis", {})
-    if isinstance(analysis, dict):
-        if isinstance(analysis.get("blunder"), int):
-            return analysis["blunder"]
-        if isinstance(analysis.get("blunders"), int):
-            return analysis["blunders"]
-
-        for color in ("white", "black"):
-            color_stats = analysis.get(color, {})
-            if isinstance(color_stats, dict):
-                if isinstance(color_stats.get("blunder"), int):
-                    return color_stats["blunder"]
-                if isinstance(color_stats.get("blunders"), int):
-                    return color_stats["blunders"]
+            return color
 
     return None
 
 
 def fetch_user_games(
-    username: str, max_games: int = GAMES_TO_ANALYZE
+    username: str, max_games: int = GAMES_TO_FETCH
 ) -> list[dict[str, Any]]:
     url = LICHESS_GAMES_URL_TEMPLATE.format(username=username)
     response = requests.get(
         url,
-        params={"max": max_games, "analysis": "true", "pgnInJson": "true"},
+        params={"max": max_games, "pgnInJson": "true"},
         headers={"Accept": "application/x-ndjson"},
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
@@ -118,6 +96,21 @@ def fetch_user_games(
         except ValueError:
             continue
     return games
+
+
+def _game_result_for_user(game: dict[str, Any], username: str) -> str:
+    color = _extract_player_color(game, username)
+    if color is None:
+        return "-"
+
+    winner = str(game.get("winner") or "").lower()
+    if winner in ("white", "black"):
+        return "W" if winner == color else "L"
+
+    status = str(game.get("status") or "").lower()
+    if status in {"aborted", "nostart", "created", "started", "unknownfinish"}:
+        return "-"
+    return "D"
 
 
 def _to_int(value: Any) -> int | None:
@@ -164,28 +157,18 @@ def compute_streamer_score(streamer: dict[str, Any]) -> StreamerScore:
     display_name = str(streamer.get("name") or username)
     stream = streamer.get("stream") or {}
     stream_status = str(stream.get("status") or "live")
-    language = str(stream.get("lang") or "-")
     stream_url = str(stream.get("url") or "")
     popularity_score = _compute_popularity_score(streamer)
 
-    blunders_last_game: int | None = None
-    analyzed_games = 0
-    games = fetch_user_games(username, max_games=GAMES_TO_ANALYZE)
-    for game in games:
-        blunders = _extract_player_blunders(game, username)
-        if blunders is None:
-            continue
-        blunders_last_game = blunders
-        analyzed_games += 1
-        break
+    games = fetch_user_games(username, max_games=GAMES_TO_FETCH)
+    results = [_game_result_for_user(game, username) for game in games]
+    last_10_results = " ".join(results) if results else "-"
 
     return StreamerScore(
         username=username,
         display_name=display_name,
         stream_status=stream_status,
-        language=language,
-        blunders_last_game=blunders_last_game,
-        analyzed_games=analyzed_games,
+        last_10_results=last_10_results,
         popularity_score=popularity_score,
         profile_url=f"https://lichess.org/@/{username}",
         stream_url=stream_url,
@@ -209,13 +192,7 @@ def load_dashboard_data() -> tuple[list[StreamerScore], str | None]:
                 scores.append(compute_streamer_score(streamer))
             except requests.RequestException:
                 continue
-        scores.sort(
-            key=lambda x: (
-                x.popularity_score,
-                x.blunders_last_game if x.blunders_last_game is not None else -1,
-            ),
-            reverse=True,
-        )
+        scores.sort(key=lambda x: x.popularity_score, reverse=True)
         return scores, None
     except requests.RequestException as exc:
         return [], f"API request failed: {exc}"
@@ -223,7 +200,7 @@ def load_dashboard_data() -> tuple[list[StreamerScore], str | None]:
 
 def _render_table(scores: list[StreamerScore]) -> None:
     if not scores:
-        st.info("No live streamers found or no analyzed games available.")
+        st.info("No live streamers found or no recent games available.")
         return
 
     rows = []
@@ -233,12 +210,8 @@ def _render_table(scores: list[StreamerScore]) -> None:
                 "Streamer": s.display_name,
                 "Username": s.username,
                 "Popularity score": s.popularity_score,
-                "Blunders (latest game)": s.blunders_last_game
-                if s.blunders_last_game is not None
-                else "-",
-                "Analyzed latest game": "Yes" if s.analyzed_games else "No",
+                "Last 10 results": s.last_10_results,
                 "Stream status": s.stream_status,
-                "Language": s.language,
                 "Profile": s.profile_url,
                 "Stream": s.stream_url or "-",
             }

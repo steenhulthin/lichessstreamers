@@ -1,6 +1,6 @@
 # Lichess Streamer Blunder Dashboard
 
-Live Streamlit dashboard that polls Lichess every 15 seconds, ranks up to 10 online streamers using a popularity proxy, and shows blunders from each streamer's latest analyzed game.
+Live Streamlit dashboard that polls Lichess every 15 seconds, ranks up to 10 online streamers using a popularity proxy, and shows each streamer's results from their latest 10 games.
 
 ## Run
 
