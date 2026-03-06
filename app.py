@@ -9,23 +9,38 @@ import streamlit as st
 POLL_SECONDS = 15
 MAX_STREAMERS = 10
 GAMES_TO_FETCH = 10
+TOP_PLAYERS_COUNT = 10
+TOP_PLAYERS_PERF_TYPE = "blitz"
+RESULTS_ORDER_LABEL = "latest first"
 LICHESS_STREAMERS_URLS = [
     "https://lichess.org/api/streamer/live",
     "https://lichess.org/api/streamers",
 ]
 LICHESS_GAMES_URL_TEMPLATE = "https://lichess.org/api/games/user/{username}"
+LICHESS_TOP_PLAYERS_URL_TEMPLATE = (
+    "https://lichess.org/api/player/top/{count}/{perf_type}"
+)
 REQUEST_TIMEOUT_SECONDS = 12
 
 
 @dataclass
 class StreamerScore:
-    username: str
     display_name: str
     stream_status: str
     last_10_results: str
+    streak: str
     popularity_score: int
     profile_url: str
-    stream_url: str
+
+
+@dataclass
+class TopPlayerScore:
+    display_name: str
+    title: str
+    rating: int | None
+    last_10_results: str
+    streak: str
+    profile_url: str
 
 
 def _get_json(url: str, params: dict[str, Any] | None = None) -> Any:
@@ -52,6 +67,18 @@ def fetch_live_streamers() -> list[dict[str, Any]]:
                 return payload["streamers"]
             if isinstance(payload.get("data"), list):
                 return payload["data"]
+    return []
+
+
+def fetch_top_players(
+    count: int = TOP_PLAYERS_COUNT, perf_type: str = TOP_PLAYERS_PERF_TYPE
+) -> list[dict[str, Any]]:
+    url = LICHESS_TOP_PLAYERS_URL_TEMPLATE.format(count=count, perf_type=perf_type)
+    payload = _get_json(url)
+    if isinstance(payload, list):
+        return [p for p in payload if isinstance(p, dict)]
+    if isinstance(payload, dict) and isinstance(payload.get("users"), list):
+        return [p for p in payload["users"] if isinstance(p, dict)]
     return []
 
 
@@ -98,6 +125,18 @@ def fetch_user_games(
     return games
 
 
+def _game_timestamp(game: dict[str, Any]) -> int:
+    for field in ("lastMoveAt", "createdAt"):
+        value = game.get(field)
+        if isinstance(value, int):
+            return value
+    return -1
+
+
+def _order_games_latest_first(games: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(games, key=_game_timestamp, reverse=True)
+
+
 def _game_result_for_user(game: dict[str, Any], username: str) -> str:
     color = _extract_player_color(game, username)
     if color is None:
@@ -111,6 +150,20 @@ def _game_result_for_user(game: dict[str, Any], username: str) -> str:
     if status in {"aborted", "nostart", "created", "started", "unknownfinish"}:
         return "-"
     return "D"
+
+
+def _compute_streak(results: list[str]) -> str:
+    if len(results) < 5:
+        return "-"
+
+    recent_five = results[:5]
+    if all(result == "W" for result in recent_five):
+        return "\U0001F525 Win x5"
+    if all(result == "D" for result in recent_five):
+        return "\U0001F91D Draw x5"
+    if all(result == "L" for result in recent_five):
+        return "\U0001F480 Loss x5"
+    return "-"
 
 
 def _to_int(value: Any) -> int | None:
@@ -152,26 +205,66 @@ def _compute_popularity_score(streamer: dict[str, Any]) -> int:
     )
 
 
+def _extract_perf_rating(player: dict[str, Any], perf_type: str) -> int | None:
+    perfs = player.get("perfs", {})
+    if isinstance(perfs, dict):
+        perf_data = perfs.get(perf_type, {})
+        if isinstance(perf_data, dict) and isinstance(perf_data.get("rating"), int):
+            return perf_data["rating"]
+    if isinstance(player.get("rating"), int):
+        return player["rating"]
+    return None
+
+
 def compute_streamer_score(streamer: dict[str, Any]) -> StreamerScore:
     username = str(streamer.get("id") or streamer.get("name") or "").strip()
     display_name = str(streamer.get("name") or username)
     stream = streamer.get("stream") or {}
     stream_status = str(stream.get("status") or "live")
-    stream_url = str(stream.get("url") or "")
     popularity_score = _compute_popularity_score(streamer)
 
-    games = fetch_user_games(username, max_games=GAMES_TO_FETCH)
+    games = _order_games_latest_first(
+        fetch_user_games(username, max_games=GAMES_TO_FETCH)
+    )
     results = [_game_result_for_user(game, username) for game in games]
     last_10_results = " ".join(results) if results else "-"
+    streak = _compute_streak(results)
 
     return StreamerScore(
-        username=username,
         display_name=display_name,
         stream_status=stream_status,
         last_10_results=last_10_results,
+        streak=streak,
         popularity_score=popularity_score,
         profile_url=f"https://lichess.org/@/{username}",
-        stream_url=stream_url,
+    )
+
+
+def compute_top_player_score(
+    player: dict[str, Any], perf_type: str = TOP_PLAYERS_PERF_TYPE
+) -> TopPlayerScore | None:
+    username = str(player.get("id") or player.get("username") or "").strip()
+    if not username:
+        return None
+
+    display_name = str(player.get("username") or player.get("name") or username)
+    title = str(player.get("title") or "")
+    rating = _extract_perf_rating(player, perf_type)
+
+    games = _order_games_latest_first(
+        fetch_user_games(username, max_games=GAMES_TO_FETCH)
+    )
+    results = [_game_result_for_user(game, username) for game in games]
+    last_10_results = " ".join(results) if results else "-"
+    streak = _compute_streak(results)
+
+    return TopPlayerScore(
+        display_name=display_name,
+        title=title,
+        rating=rating,
+        last_10_results=last_10_results,
+        streak=streak,
+        profile_url=f"https://lichess.org/@/{username}",
     )
 
 
@@ -198,7 +291,27 @@ def load_dashboard_data() -> tuple[list[StreamerScore], str | None]:
         return [], f"API request failed: {exc}"
 
 
-def _render_table(scores: list[StreamerScore]) -> None:
+def load_top_players_data() -> tuple[list[TopPlayerScore], str | None]:
+    try:
+        top_players = fetch_top_players(
+            count=TOP_PLAYERS_COUNT,
+            perf_type=TOP_PLAYERS_PERF_TYPE,
+        )
+        scores: list[TopPlayerScore] = []
+        for player in top_players:
+            try:
+                score = compute_top_player_score(player, perf_type=TOP_PLAYERS_PERF_TYPE)
+            except requests.RequestException:
+                continue
+            if score is None:
+                continue
+            scores.append(score)
+        return scores, None
+    except requests.RequestException as exc:
+        return [], f"Top players API request failed: {exc}"
+
+
+def _render_streamers_table(scores: list[StreamerScore]) -> None:
     if not scores:
         st.info("No live streamers found or no recent games available.")
         return
@@ -208,12 +321,33 @@ def _render_table(scores: list[StreamerScore]) -> None:
         rows.append(
             {
                 "Streamer": s.display_name,
-                "Username": s.username,
                 "Popularity score": s.popularity_score,
-                "Last 10 results": s.last_10_results,
+                f"Last 10 results ({RESULTS_ORDER_LABEL})": s.last_10_results,
+                "Streak": s.streak,
                 "Stream status": s.stream_status,
                 "Profile": s.profile_url,
-                "Stream": s.stream_url or "-",
+            }
+        )
+
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
+def _render_top_players_table(scores: list[TopPlayerScore]) -> None:
+    if not scores:
+        st.info("No top players found or no recent games available.")
+        return
+
+    rows = []
+    for s in scores:
+        rows.append(
+            {
+                "Player": f"{s.title} {s.display_name}".strip(),
+                f"{TOP_PLAYERS_PERF_TYPE.capitalize()} rating": (
+                    s.rating if s.rating is not None else "-"
+                ),
+                f"Last 10 results ({RESULTS_ORDER_LABEL})": s.last_10_results,
+                "Streak": s.streak,
+                "Profile": s.profile_url,
             }
         )
 
@@ -230,12 +364,20 @@ st.caption(
 @st.fragment(run_every=POLL_SECONDS)
 def live_dashboard() -> None:
     started = time.strftime("%Y-%m-%d %H:%M:%S")
-    scores, error = load_dashboard_data()
     st.write(f"Last refresh: {started}")
-    if error:
-        st.error(error)
+    st.subheader("Live Streamers")
+    streamer_scores, streamer_error = load_dashboard_data()
+    if streamer_error:
+        st.error(streamer_error)
+    else:
+        _render_streamers_table(streamer_scores)
+
+    st.subheader(f"Top {TOP_PLAYERS_COUNT} {TOP_PLAYERS_PERF_TYPE.capitalize()} Players")
+    top_scores, top_error = load_top_players_data()
+    if top_error:
+        st.error(top_error)
         return
-    _render_table(scores)
+    _render_top_players_table(top_scores)
 
 
 live_dashboard()
